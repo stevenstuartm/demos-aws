@@ -1,0 +1,81 @@
+version: 0.2
+    
+phases:   
+  install:
+    runtime-versions:
+      dotnet: 8.0
+    commands:
+      - export PATH="$PATH:/root/.dotnet/tools"
+      - dotnet tool install -g AWS.CodeArtifact.NuGet.CredentialProvider
+      - dotnet codeartifact-creds install
+      - ENVVAR_APP="demo-service"
+      - ENVAR_PROJECT_NAME='DEMO.Service'
+      - ENVVAR_BUILD_TYPE="Release"
+      - ENVVAR_DEMO_ACCOUNT=$(aws sts get-caller-identity --query "Account" --output text)
+      - ENVVAR_DEMO_REGION='us-east-2'
+      - ENVVAR_DEPLOYSPEC_PATH='eks/deployment-services-v1.yaml'
+      - ENVAR_DEVOPS_BUCKET=demo-$demo-devops
+      - ENVVAR_CLUSTER=demo
+      - ENVVAR_TERMINATION_GRACE_PERIOD_SECONDS=10
+      - ENVVAR_RESOURCES_REQUESTS_CPU=350m
+      - ENVVAR_RESOURCES_REQUESTS_MEMORY=300Mi
+      - ENVVAR_MIN_REPLICAS=1
+      - ENVVAR_MAX_REPLICAS=2
+      - ENVVAR_UTILIZATION_CPU_AVERAGE=90
+  pre_build:
+    commands:
+      - pwsh # Load the PowerShell environment
+      - releaseVersion=$(pwsh -Command '(Get-Content version | Out-String).Trim()') # Read the release version
+      - prereleaseVersion=$(pwsh -Command '(Get-Content prereleaseversion | Out-String).Trim()') # Read the pre-release version
+      
+      # Set up CodeArtifact source access so that the build can access custom nuget packages
+      - export demo_nuget_source=$(aws codeartifact get-repository-endpoint --domain demo-domain --domain-owner $ENVVAR_DEMO_ACCOUNT --repository demo-nuget --format nuget --query repositoryEndpoint --output text)"v3/index.json"
+      - export demo_nuget_token=$(aws codeartifact get-authorization-token --duration-seconds 900 --domain "demo-domain" --domain-owner $ENVVAR_DEMO_ACCOUNT --query authorizationToken --output text)
+      - dotnet nuget add source -n codeartifact $demo_nuget_source
+      
+      # Set up ECR repository and login
+      - export ecrRepo=$ENVVAR_DEMO_ACCOUNT.dkr.ecr.$ENVVAR_DEMO_REGION.amazonaws.com/$ENVVAR_APP
+      - aws ecr get-login-password --region $ENVVAR_DEMO_REGION | docker login --username AWS --password-stdin $ENVVAR_DEMO_ACCOUNT.dkr.ecr.$ENVVAR_DEMO_REGION.amazonaws.com
+      
+      # Set up kubectl configuration
+      - export KUBECONFIG=$HOME/.kube/config
+      - aws eks update-kubeconfig --name $ENVVAR_CLUSTER
+
+      - imageVersion=$releaseVersion
+      - deployOnly=0
+      # Check if the image already exists in ECR
+      - IMAGE_META="$( aws ecr batch-get-image --repository-name=$ENVVAR_APP --image-ids=imageTag=$imageVersion --query 'images[].imageId.imageTag' --output text )"
+      - |
+        if [ "$IMAGE_META" = $imageVersion ]; then
+          deployOnly=1
+        fi
+      # Download the EKS deployment template
+      - aws s3api get-object --bucket $ENVAR_DEVOPS_BUCKET --key $ENVVAR_DEPLOYSPEC_PATH deployment.yaml
+  build:
+    commands:
+      - |
+        if [ "$deployOnly" = 0 ]; then
+          dotnet restore $ENVAR_PROJECT_NAME.sln
+          dotnet build -c $ENVVAR_BUILD_TYPE $ENVAR_PROJECT_NAME.sln
+          docker build -t $ecrRepo:$imageVersion . -f Dockerfile --build-arg DEMO_NUGET_SOURCE=$demo_nuget_source --build-arg DEMO_NUGET_TOKEN=$demo_nuget_token
+        fi
+  post_build:
+    commands:
+      - |
+        if [ "$deployOnly" = 0 ]; then
+          pwsh
+          $ENVAR_PROJECT_NAME.Migrations/bin/$ENVVAR_BUILD_TYPE/net8.0/$ENVAR_PROJECT_NAME.Migrations stage:$ENVVAR_DEMO_STAGE
+          docker push $ecrRepo:$imageVersion
+        fi
+      - sed -i 's@CONTAINER_IMAGE@'"$ecrRepo:$imageVersion"'@' deployment.yaml
+      - sed -i 's@ENVVAR_DEMO_STAGE@'"$ENVVAR_DEMO_STAGE"'@' deployment.yaml
+      - sed -i 's@ENVVAR_DEMO_REGION@'"$ENVVAR_DEMO_REGION"'@' deployment.yaml
+      - sed -i 's@ENVVAR_DEMO_ACCOUNT@'"$ENVVAR_DEMO_ACCOUNT"'@' deployment.yaml
+      - sed -i 's@ENVVAR_APP@'"$ENVVAR_APP"'@' deployment.yaml
+      - sed -i 's@ENVVAR_TERMINATION_GRACE_PERIOD_SECONDS@'"$ENVVAR_TERMINATION_GRACE_PERIOD_SECONDS"'@' deployment.yaml
+      - sed -i 's@ENVVAR_RESOURCES_REQUESTS_CPU@'"$ENVVAR_RESOURCES_REQUESTS_CPU"'@' deployment.yaml
+      - sed -i 's@ENVVAR_RESOURCES_REQUESTS_MEMORY@'"$ENVVAR_RESOURCES_REQUESTS_MEMORY"'@' deployment.yaml
+      - sed -i 's@ENVVAR_MIN_REPLICAS@'"$ENVVAR_MIN_REPLICAS"'@' deployment.yaml
+      - sed -i 's@ENVVAR_MAX_REPLICAS@'"$ENVVAR_MAX_REPLICAS"'@' deployment.yaml
+      - sed -i 's@ENVVAR_UTILIZATION_CPU_AVERAGE@'"$ENVVAR_UTILIZATION_CPU_AVERAGE"'@' deployment.yaml
+      - kubectl apply -f deployment.yaml

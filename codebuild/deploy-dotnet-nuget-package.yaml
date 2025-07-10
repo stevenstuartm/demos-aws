@@ -1,0 +1,33 @@
+version: 0.2
+    
+phases:   
+  install:
+    runtime-versions:
+      dotnet: 9.0.203
+    commands:
+      - export PATH="$PATH:/root/.dotnet/tools"
+      - dotnet tool install -g AWS.CodeArtifact.NuGet.CredentialProvider
+      - dotnet codeartifact-creds install
+      - DEMO_ACCOUNT=$(aws sts get-caller-identity --query "Account" --output text)
+      - DEMO_REGION='us-east-2'
+  pre_build:
+    commands:
+      - pwsh # Start PowerShell session
+      - releaseVersion=$(pwsh -Command '(Get-Content version | Out-String).Trim()') # Read release version
+      - prereleaseVersion=$(pwsh -Command '(Get-Content prereleaseversion | Out-String).Trim()') # Read pre-release version
+      
+      # Set up CodeArtifact source access so that the build can access custom nuget packages
+      - export nuget_source=$(aws codeartifact get-repository-endpoint --domain demo-domain --domain-owner $DEMO_ACCOUNT --repository demo-nuget --format nuget --query repositoryEndpoint --output text)"v3/index.json"
+      - export nuget_token=$(aws codeartifact get-authorization-token --duration-seconds 900 --domain "demo-domain" --domain-owner $DEMO_ACCOUNT --query authorizationToken --output text)
+      - dotnet nuget add source -n codeartifact $nuget_source
+      
+      - imageVersion=$releaseVersion
+      - buildtype="Release"
+  build:
+    commands:
+      - dotnet restore demo.sln
+      - dotnet build -c Release demo.sln
+      - dotnet pack -c Release ./demo/demo.csproj /p:Version=$imageVersion
+  post_build:
+    commands:
+      - dotnet nuget push ./demo/bin/$buildtype/demo.$imageVersion.nupkg -s $nuget_source

@@ -1,0 +1,36 @@
+version: 0.2
+    
+phases:   
+  install:
+    runtime-versions:
+      dotnet: 9.0.203
+  pre_build:
+    commands:
+      - pwsh # Use PowerShell to read the version from a file
+      - releaseVersion=$(pwsh -Command '(Get-Content version | Out-String).Trim()') # Read the version from a file named 'version'
+      - prereleaseVersion=$releaseVersion-pre$CODEBUILD_BUILD_NUMBER # Append the build number to the version
+  build:
+    commands:
+      - dotnet restore demo.sln
+      - dotnet build demo.sln
+      - dotnet test **/*.Tests.csproj --logger trx --results-directory ./testresults
+
+      - echo $prereleaseVersion > prereleaseversion
+
+      # We can either create the artifact (nuget package) now or store the code as an artifact which has been "verified".
+      # In this case we save the code as an artifact and will only create the nuget package when we are committed to a release and deploy it.
+      # This saves on storage costs and does not commit to an artifact without due cause.
+      # So ... we remove all resources that are not needed to store and rebuild the code (debug, bin, git, vs, ect)
+      - dotnet clean
+      - rm -rf '.git'
+      - rm -rf '.vs'
+artifacts:
+  files:
+    - '**/*'
+  name: $prereleaseVersion.zip
+reports:
+  DotnetTestResults:
+      file-format: VisualStudioTrx
+      files:
+          - '**/*'
+      base-directory: './testresults'

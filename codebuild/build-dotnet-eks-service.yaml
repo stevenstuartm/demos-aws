@@ -1,0 +1,46 @@
+version: 0.2
+    
+phases:   
+  install:
+    runtime-versions:
+      dotnet: 8.0
+    commands:
+      - export PATH="$PATH:/root/.dotnet/tools"
+      - dotnet tool install -g AWS.CodeArtifact.NuGet.CredentialProvider
+      - dotnet codeartifact-creds install
+      - DEMO_ACCOUNT=$(aws sts get-caller-identity --query "Account" --output text)
+  pre_build:
+    commands:
+      - pwsh # Start PowerShell session
+      - releaseVersion=$(pwsh -Command '(Get-Content version | Out-String).Trim()') # Read release version
+      - prereleaseVersion=$releaseVersion-pre$CODEBUILD_BUILD_NUMBER # Read pre-release version
+
+      # Set up CodeArtifact source access so that the build can access custom nuget packages
+      - export demo_nuget_source=$(aws codeartifact get-repository-endpoint --domain demo-domain --domain-owner $DEMO_ACCOUNT --repository demo-nuget --format nuget --query repositoryEndpoint --output text)"v3/index.json"
+      - export demo_nuget_token=$(aws codeartifact get-authorization-token --duration-seconds 900 --domain "demo-domain" --domain-owner $DEMO_ACCOUNT --query authorizationToken --output text)
+      - dotnet nuget add source -n codeartifact $demo_nuget_source
+  build:
+    commands:
+      - dotnet restore demo-api.sln
+      - dotnet build demo-api.sln
+      - dotnet test **/*.Tests.csproj --logger trx --results-directory ./testresults
+
+      - echo $prereleaseVersion > prereleaseversion
+      
+      # We can either create the artifact (nuget package) now or store the code as an artifact which has been "verified".
+      # In this case we save the code as an artifact and will only create the nuget package when we are committed to a release and deploy it.
+      # This saves on storage costs and does not commit to an artifact without due cause.
+      # So ... we remove all resources that are not needed to store and rebuild the code (debug, bin, git, vs, ect)
+      - dotnet clean
+      - rm -rf '.git'
+      - rm -rf '.vs'
+artifacts:
+  files:
+    - '**/*'
+  name: $prereleaseVersion.zip
+reports:
+  DotnetTestResults:
+      file-format: VisualStudioTrx
+      files:
+          - '**/*'
+      base-directory: './testresults'

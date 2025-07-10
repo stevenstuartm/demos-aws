@@ -1,0 +1,17 @@
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      nodejs: 22.11.0
+    commands:
+        - version=$(jq .version package.json)
+        - CF_DISTRIBUTION_ID=[someid] # or get it from the codebuild project environment variables
+  build:
+    commands:
+      - npm install -g pnpm
+      - pnpm install
+      - pnpm run build
+      
+      - aws s3 sync './dist' 's3://demo.com/' #update the s3 bucket which is the origin for the CloudFront distribution
+      - aws cloudfront create-invalidation --distribution-id=$CF_DISTRIBUTION_ID --paths '/*' #refresh the CloudFront distribution cache
