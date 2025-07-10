@@ -1,0 +1,36 @@
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: demo
+  region: us-east-2
+
+managedNodeGroups:
+  - name: demo-workers-spot-t2md
+    minSize: 1
+    maxSize: 1
+    desiredCapacity: 1
+    instanceTypes: ["t2.medium"]
+    spot: true
+    labels:
+      tier: workers
+      workerClass: spot-t2mdn
+    privateNetworking: true
+    subnets:
+      - [private subnet a]
+      - [private subnet b]
+    iam:
+      withAddonPolicies:
+        imageBuilder: true
+        autoScaler: true
+        externalDNS: true
+        certManager: true
+        appMesh: true
+        appMeshPreview: true
+        ebs: true
+        fsx: true
+        efs: true
+        awsLoadBalancerController: true
+        xRay: true
+        cloudWatch: true
+        

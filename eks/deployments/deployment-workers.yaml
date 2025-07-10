@@ -1,0 +1,48 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  namespace: demo-default
+  labels:
+    app: ENVVAR_APP
+  name: ENVVAR_APP
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ENVVAR_APP
+  template:
+    metadata:
+      labels:
+         app: ENVVAR_APP
+    spec:
+      containers:
+        - name: ENVVAR_APP
+          image: CONTAINER_IMAGE
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              protocol: TCP
+              containerPort: 80
+            - name: https
+              protocol: TCP
+              containerPort: 443
+            - name: https-alt
+              protocol: TCP
+              containerPort: 4443
+          resources:
+            requests:
+              cpu: ENVVAR_RESOURCES_REQUESTS_CPU
+              memory: ENVVAR_RESOURCES_REQUESTS_MEMORY
+          env:
+            - name: _STAGE
+              value: ENVVAR__STAGE
+            - name: ASPNETCORE_ENVIRONMENT
+              value: Production
+            - name: _REGION
+              value: ENVVAR__REGION
+            - name: _ACCOUNT
+              value: "ENVVAR__ACCOUNT"
+            - name: ASPNETCORE_HTTP_PORTS
+              value: "80"
+      nodeSelector:
+        workerClass: spot-t2mdn

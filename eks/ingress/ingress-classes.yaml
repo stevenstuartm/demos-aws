@@ -1,0 +1,8 @@
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: public-alb
+  annotations:
+    ingressclass.kubernetes.io/isdefault-class: "true"
+spec:
+  controller: ingress.k8s.aws/alb
