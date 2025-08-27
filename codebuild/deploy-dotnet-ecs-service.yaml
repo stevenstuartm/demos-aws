@@ -1,0 +1,125 @@
+version: 0.2
+    
+phases:   
+  install:
+    runtime-versions:
+      dotnet: 8.0
+    commands:
+      - echo "=== INSTALL PHASE STARTED ==="
+      - export PATH="$PATH:/root/.dotnet/tools"
+      - dotnet tool install -g AWS.CodeArtifact.NuGet.CredentialProvider
+      - dotnet codeartifact-creds install
+      - ENVVAR_APP="demo-services"
+      - ENVAR_PROJECT_NAME='DEMO.Service'
+      - ENVVAR_DEMO_STAGE='prod'
+      - ENVVAR_BUILD_TYPE="Release"
+      - ENVVAR_DEMO_ACCOUNT=$(aws sts get-caller-identity --query "Account" --output text)
+      - ENVVAR_DEMO_REGION='us-east-2'
+      - ENVVAR_ECS_CLUSTER=$ENVVAR_DEMO_STAGE-public-services
+      - ENVVAR_ECS_SERVICE=$ENVVAR_DEMO_STAGE-$ENVVAR_APP
+      - ENVVAR_TASK_DEFINITION_FAMILY=$ENVVAR_DEMO_STAGE-$ENVVAR_APP
+      - ENVVAR_CONTAINER_NAME=$ENVVAR_APP
+      - echo "=== INSTALL PHASE COMPLETED ==="
+      
+  pre_build:
+    commands:
+      - echo "=== PRE_BUILD PHASE STARTED ==="
+      - pwsh
+      - releaseVersion=$(pwsh -Command '(Get-Content version | Out-String).Trim()')
+      - prereleaseVersion=$(pwsh -Command '(Get-Content prereleaseversion | Out-String).Trim()')
+      - echo "Release version $releaseVersion"
+      - echo "Prerelease version $prereleaseVersion"
+      - export demo_nuget_source=$(aws codeartifact get-repository-endpoint --domain true-market-insiders --domain-owner $ENVVAR_DEMO_ACCOUNT --repository demo-nuget --format nuget --query repositoryEndpoint --output text)"v3/index.json"
+      - export demo_nuget_token=$(aws codeartifact get-authorization-token --duration-seconds 900 --domain "true-market-insiders" --domain-owner $ENVVAR_DEMO_ACCOUNT --query authorizationToken --output text)
+      - dotnet nuget add source -n codeartifact $demo_nuget_source
+      - export ecrRepo=$ENVVAR_DEMO_ACCOUNT.dkr.ecr.$ENVVAR_DEMO_REGION.amazonaws.com/$ENVVAR_APP
+      - echo "ECR Repository $ecrRepo"
+      - aws ecr get-login-password --region $ENVVAR_DEMO_REGION | docker login --username AWS --password-stdin $ENVVAR_DEMO_ACCOUNT.dkr.ecr.$ENVVAR_DEMO_REGION.amazonaws.com
+      - imageVersion=$releaseVersion
+      - echo "Image version to deploy $imageVersion"
+      - deployOnly=0
+      - IMAGE_META="$( aws ecr batch-get-image --repository-name=$ENVVAR_APP --image-ids=imageTag=$imageVersion --query 'images[].imageId.imageTag' --output text )"
+      - echo "ECR image check result '$IMAGE_META'"
+      - |
+        if [ "$IMAGE_META" = $imageVersion ]; then
+          deployOnly=1
+          echo "Image exists in ECR - setting deployOnly=1"
+        else
+          echo "Image not found in ECR - will build new image"
+        fi
+      - echo "=== PRE_BUILD PHASE COMPLETED ==="
+      
+  build:
+    commands:
+      - echo "=== BUILD PHASE STARTED ==="
+      - echo "deployOnly value $deployOnly"
+      - |
+        if [ "$deployOnly" = 0 ]; then
+          echo "Starting build process..."
+          echo "Restoring NuGet packages..."
+          dotnet restore $ENVAR_PROJECT_NAME.sln
+          
+          echo "Building solution..."
+          dotnet build -c $ENVVAR_BUILD_TYPE $ENVAR_PROJECT_NAME.sln
+          
+          echo "Building Docker image..."
+          docker build -t $ecrRepo:$imageVersion . -f Dockerfile --build-arg demo_NUGET_SOURCE=$demo_nuget_source --build-arg demo_NUGET_TOKEN=$demo_nuget_token
+          
+          echo "Docker build completed"
+        else
+          echo "Skipping build - deployOnly=1"
+        fi
+      - echo "=== BUILD PHASE COMPLETED ==="
+      
+  post_build:
+    commands:
+    - echo "=== POST_BUILD PHASE STARTED ==="
+    - echo "deployOnly value in post_build $deployOnly"
+    - |
+        if [ "$deployOnly" = 0 ]; then
+          echo "Pushing Docker image..."
+          docker push $ecrRepo:$imageVersion
+          echo "Image push completed"
+        else
+          echo "Skipping push - deployOnly=1"
+        fi
+    - echo "Starting ECS deployment process..."
+    - echo "Checking if task definition exists..."
+    - |
+        TASK_DEF_EXISTS=$(aws ecs describe-task-definition --task-definition $ENVVAR_TASK_DEFINITION_FAMILY --query 'taskDefinition.taskDefinitionArn' --output text 2>/dev/null || echo "NONE")
+        
+        if [ "$TASK_DEF_EXISTS" = "NONE" ] || [ "$TASK_DEF_EXISTS" = "" ]; then
+          echo "task definition does not exist: $NEW_TASK_DEF_ARN"
+          exit 1
+        else
+          echo "Task definition exists, updating existing one..."
+          CURRENT_TASK_DEF=$(aws ecs describe-task-definition --task-definition $ENVVAR_TASK_DEFINITION_FAMILY --query 'taskDefinition')
+          echo "Retrieved current task definition"
+          
+          NEW_TASK_DEF=$(echo $CURRENT_TASK_DEF | jq --arg IMAGE "$ecrRepo:$imageVersion" --arg CONTAINER "$ENVVAR_CONTAINER_NAME" --arg demo_ACCOUNT "$ENVVAR_DEMO_ACCOUNT" --arg demo_REGION "$ENVVAR_DEMO_REGION" --arg demo_STAGE "$ENVVAR_DEMO_STAGE" '
+            .containerDefinitions |= map(
+              if .name == $CONTAINER then
+                .image = $IMAGE |
+                .environment = ([
+                  {"name": "ASPNETCORE_HTTP_PORTS", "value": "80"},
+                  {"name": "demo_ACCOUNT", "value": $demo_ACCOUNT},
+                  {"name": "ASPNETCORE_ENVIRONMENT", "value": "Production"},
+                  {"name": "demo_REGION", "value": $demo_REGION},
+                  {"name": "demo_STAGE", "value": $demo_STAGE}
+                ] + ((.environment // []) | map(select(.name | IN("ASPNETCORE_HTTP_PORTS", "demo_ACCOUNT", "ASPNETCORE_ENVIRONMENT", "demo_REGION", "demo_STAGE") | not))))
+              else . 
+              end
+            ) |
+            del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .placementConstraints, .compatibilities, .registeredAt, .registeredBy)
+          ')
+          echo "Created updated task definition JSON"
+          echo "$NEW_TASK_DEF" > /tmp/task-def.json
+          echo "Saved task definition to file"
+          NEW_TASK_DEF_ARN=$(aws ecs register-task-definition --cli-input-json file:///tmp/task-def.json --query 'taskDefinition.taskDefinitionArn' --output text)
+          echo "Registered updated task definition: $NEW_TASK_DEF_ARN"
+        fi
+    - echo "Updating ECS service with new task definition..."
+    - aws ecs update-service --cluster $ENVVAR_ECS_CLUSTER --service $ENVVAR_ECS_SERVICE --task-definition $NEW_TASK_DEF_ARN
+    - echo "Updated ECS service"
+    - aws ecs wait services-stable --cluster $ENVVAR_ECS_CLUSTER --services $ENVVAR_ECS_SERVICE
+    - echo "=== POST_BUILD PHASE COMPLETED ==="
