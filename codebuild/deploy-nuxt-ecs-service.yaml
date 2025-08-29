@@ -1,0 +1,165 @@
+version: 0.2
+    
+phases:   
+  install:
+    runtime-versions:
+      nodejs: 20
+    commands:
+      - echo "=== INSTALL PHASE STARTED ==="
+      - npm install -g pnpm@10.13.1
+      - ENVVAR_APP="demos-nuxt"
+      - ENVVAR_STAGE='prod'
+      - ENVVAR_BUILD_TYPE="production"
+      - ENVVAR_ACCOUNT=$(aws sts get-caller-identity --query "Account" --output text)
+      - ENVVAR_REGION='us-east-2'
+      - ENVVAR_ECS_CLUSTER=$ENVVAR_STAGE-public-services
+      - ENVVAR_ECS_SERVICE=$ENVVAR_STAGE-$ENVVAR_APP
+      - ENVVAR_TASK_DEFINITION_FAMILY=$ENVVAR_STAGE-$ENVVAR_APP
+      - ENVVAR_CONTAINER_NAME=$ENVVAR_APP
+      - ENVVAR_FIREBASE_PARAM_PATH="/$ENVVAR_STAGE/firebase/apps/demo/access"
+      - echo "=== INSTALL PHASE COMPLETED ==="
+      
+  pre_build:
+    commands:
+      - echo "=== PRE_BUILD PHASE STARTED ==="
+      - echo "Retrieving version information..."
+      - |
+        if [ ! -f "package.json" ]; then
+          echo "ERROR: package.json not found"
+          exit 1
+        fi
+      - releaseVersion=$(jq -r '.version' package.json)
+      - |
+        if [ "$releaseVersion" = "null" ] || [ -z "$releaseVersion" ]; then
+          echo "ERROR: Version not found in package.json"
+          exit 1
+        fi
+      - prereleaseVersion=$releaseVersion-pre$CODEBUILD_BUILD_NUMBER
+      - echo "Image version $prereleaseVersion"
+      - echo "Retrieving Firebase configuration from Parameter Store..."
+      - export FIREBASE_CONFIG=$(aws ssm get-parameter --name "$ENVVAR_FIREBASE_PARAM_PATH" --with-decryption --query 'Parameter.Value' --output text)
+      - echo "Firebase config retrieved successfully"
+      - echo "Extracting Firebase environment variables..."
+      # Extract Firebase configuration values using correct field names from param structure
+      - export FIREBASE_PROJECT_ID=$(echo $FIREBASE_CONFIG | jq -r '.project_id')
+      - export FIREBASE_AUTH_DOMAIN="$FIREBASE_PROJECT_ID.firebaseapp.com"
+      - export FIREBASE_STORAGE_BUCKET=$(echo $FIREBASE_CONFIG | jq -r '.storage_bucket')
+      - export FIREBASE_API_KEY=$(echo $FIREBASE_CONFIG | jq -r '.api_key')
+      - export FIREBASE_MESSAGING_SENDER_ID=$(echo $FIREBASE_CONFIG | jq -r '.sender_id')
+      - export FIREBASE_APP_ID=$(echo $FIREBASE_CONFIG | jq -r '.app_id')
+      - echo "Setting up ECR..."
+      - export ecrRepo=$ENVVAR_ACCOUNT.dkr.ecr.$ENVVAR_REGION.amazonaws.com/$ENVVAR_APP
+      - echo "ECR Repository $ecrRepo"
+      - aws ecr get-login-password --region $ENVVAR_REGION | docker login --username AWS --password-stdin $ENVVAR_ACCOUNT.dkr.ecr.$ENVVAR_REGION.amazonaws.com
+      - echo "Checking if image already exists in ECR..."
+      - deployOnly=0
+      - export deployOnly
+      - IMAGE_META="$( aws ecr batch-get-image --repository-name=$ENVVAR_APP --image-ids=imageTag=$prereleaseVersion --query 'images[].imageId.imageTag' --output text 2>/dev/null || echo '' )"
+      - echo "ECR image check result '$IMAGE_META'"
+      - |
+        if [ "$IMAGE_META" = "$prereleaseVersion" ]; then
+          deployOnly=1
+          export deployOnly
+          echo "Image exists in ECR - setting deployOnly=1"
+        else
+          echo "Image not found in ECR - will build new image"
+        fi
+      - echo "=== PRE_BUILD PHASE COMPLETED ==="
+      
+  build:
+    commands:
+      - echo "=== BUILD PHASE STARTED ==="
+      - cp .env.development .env
+      - echo "deployOnly value $deployOnly"
+      - |
+        if [ "$deployOnly" = "0" ]; then
+          echo "Starting build process..."
+          echo "Installing dependencies..."
+          pnpm install --frozen-lockfile
+          
+          echo "Building Nuxt application..."
+          NODE_ENV=production pnpm run build
+          
+          echo "Building Docker image..."
+          if ! docker build -t $ecrRepo:$prereleaseVersion .; then
+            echo "ERROR: Docker build failed"
+            exit 1
+          fi
+          
+          echo "Verifying Docker image was created..."
+          if ! docker images $ecrRepo:$prereleaseVersion --format "table {{.Repository}}:{{.Tag}}" | grep -q "$ecrRepo:$prereleaseVersion"; then
+            echo "ERROR: Docker image was not created successfully"
+            exit 1
+          fi
+          
+          echo "Docker build completed successfully"
+        else
+          echo "Skipping build - deployOnly=1"
+        fi
+      - echo "=== BUILD PHASE COMPLETED ==="
+      
+  post_build:
+    commands:
+      - echo "=== POST_BUILD PHASE STARTED ==="
+      - echo "deployOnly value in post_build $deployOnly"
+      - |
+        if [ "$deployOnly" = "0" ]; then
+          echo "Pushing Docker image to ECR..."
+          docker push $ecrRepo:$prereleaseVersion
+          echo "Image push completed"
+        else
+          echo "Skipping push - deployOnly=1"
+        fi
+      - echo "Starting ECS deployment process..."
+      - echo "Checking if task definition exists..."
+      # Fixed shell syntax - separate commands instead of multi-line block
+      - set +e
+      - TASK_DEF_CHECK=$(aws ecs describe-task-definition --task-definition $ENVVAR_TASK_DEFINITION_FAMILY 2>&1)
+      - TASK_DEF_EXIT_CODE=$?
+      - set -e
+      - |
+        if [ $TASK_DEF_EXIT_CODE -ne 0 ]; then
+          echo "Task definition does not exist or error occurred: $ENVVAR_TASK_DEFINITION_FAMILY"
+          echo "Error details: $TASK_DEF_CHECK"
+          exit 1
+        else
+          echo "Task definition exists, updating existing one..."
+        fi
+      - CURRENT_TASK_DEF=$(aws ecs describe-task-definition --task-definition $ENVVAR_TASK_DEFINITION_FAMILY --query 'taskDefinition')
+      - echo "Retrieved current task definition"
+      # Create the updated task definition using a file-based approach to avoid quote escaping issues
+      - echo "$CURRENT_TASK_DEF" > /tmp/current-task-def.json
+      - echo "Saved current task definition to file"
+      # Create environment variables as a JSON array file
+      - |
+        cat > /tmp/env-vars.json << EOF
+        [
+          {"name": "NODE_ENV", "value": "production"},
+          {"name": "NUXT_HOST", "value": "0.0.0.0"},
+          {"name": "NUXT_PORT", "value": "80"},
+          {"name": "PORT", "value": "80"},
+          {"name": "NUXT_PUBLIC_FIREBASE_PROJECT_ID", "value": "$FIREBASE_PROJECT_ID"},
+          {"name": "NUXT_PUBLIC_FIREBASE_AUTH_DOMAIN", "value": "$FIREBASE_AUTH_DOMAIN"},
+          {"name": "NUXT_PUBLIC_FIREBASE_STORAGE_BUCKET", "value": "$FIREBASE_STORAGE_BUCKET"},
+          {"name": "NUXT_PUBLIC_FIREBASE_API_KEY", "value": "$FIREBASE_API_KEY"},
+          {"name": "NUXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID", "value": "$FIREBASE_MESSAGING_SENDER_ID"},
+          {"name": "NUXT_PUBLIC_FIREBASE_APP_ID", "value": "$FIREBASE_APP_ID"},
+          {"name": "ACCOUNT", "value": "$ENVVAR_ACCOUNT"},
+          {"name": "REGION", "value": "$ENVVAR_REGION"},
+          {"name": "STAGE", "value": "$ENVVAR_STAGE"}
+        ]
+        EOF
+      - echo "Created environment variables JSON"
+      # Update the task definition using simple jq operations
+      - jq --arg IMAGE "$ecrRepo:$prereleaseVersion" --arg CONTAINER "$ENVVAR_CONTAINER_NAME" --slurpfile ENVVARS /tmp/env-vars.json '.containerDefinitions |= map(if .name == $CONTAINER then .image = $IMAGE | .environment = $ENVVARS[0] else . end)' /tmp/current-task-def.json > /tmp/updated-task-def.json
+      - echo "Updated container image and environment variables"
+      # Remove unwanted fields from task definition
+      - jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .placementConstraints, .compatibilities, .registeredAt, .registeredBy)' /tmp/updated-task-def.json > /tmp/task-def.json
+      - echo "Cleaned task definition for registration"
+      - NEW_TASK_DEF_ARN=$(aws ecs register-task-definition --cli-input-json file:///tmp/task-def.json --query 'taskDefinition.taskDefinitionArn' --output text)
+      - echo "Registered updated task definition $NEW_TASK_DEF_ARN"
+      - echo "Updating ECS service with new task definition..."
+      - aws ecs update-service --cluster $ENVVAR_ECS_CLUSTER --service $ENVVAR_ECS_SERVICE --task-definition $NEW_TASK_DEF_ARN
+      - echo "Updated ECS service"
+      - aws ecs wait services-stable --cluster $ENVVAR_ECS_CLUSTER --services $ENVVAR_ECS_SERVICE
+      - echo "=== POST_BUILD PHASE COMPLETED ==="
