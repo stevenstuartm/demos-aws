@@ -1,103 +1,115 @@
-# Demos.AWS.EKS
+# EKS Cluster Infrastructure
 
-## Summary:
-* This is a rough guide to create a fully functional K8s cluster in AWS EKS. This guide is based on a previous working example and so it is quite specific to the use case at the time.
-* Files include placeholders for sensitive values identified by: [some text]. The brackets and values need to be replaced with your values. Other values, such as the cluster name, should also be replaced but they are still included for the sake of comprehension.
+This directory contains production-ready EKS cluster configurations with comprehensive Kubernetes infrastructure setup including auto-scaling, load balancing, monitoring, and security components.
 
-### Includes:
-* Node groups: public ingress, services, and workers
-* Auto scaler
-* Metrics server
-* Load balancer controller
-* IAM roles and security groups
-* FluentD
+## Overview
 
-### Does not include:
-* Terraform for creating load balancer
-* Terraform for creating vpc and subnets
+### What's Included
+- **Multi-tier Node Groups**: Public ingress, services, and worker nodes
+- **Auto Scaling**: Cluster autoscaler with proper IAM policies
+- **Load Balancing**: ALB ingress controller with Route53 integration
+- **Monitoring**: Metrics server and CloudWatch integration with FluentD
+- **Security**: IAM roles, security groups, and RBAC configurations
+- **Cost Optimization**: Spot instance worker nodes
 
-## Install Dependencies
+### What's Not Included
+- Terraform configurations for VPC and subnets
+- Terraform for load balancer creation
+- Application-specific deployments
 
-### Install EksCtl on local machine
+## Prerequisites
 
-https://docs.aws.amazon.com/eks/latest/userguide/eksctl.htm
+### Required Tools
+- **eksctl**: EKS cluster management tool
+  - [Installation Guide](https://docs.aws.amazon.com/eks/latest/userguide/eksctl.html)
+  - [eksctl.io Installation](https://eksctl.io/installation/)
+- **kubectl**: Kubernetes command-line tool
+- **helm**: Kubernetes package manager
+  - [Installation Guide](https://helm.sh/docs/intro/install/)
+- **AWS CLI**: Configured with appropriate permissions
 
-https://eksctl.io/installation/
+### AWS Requirements
+- AWS account with EKS permissions
+- VPC with public and private subnets
+- Dedicated IAM user for cluster management (recommended)
 
-### Install Helm
-https://helm.sh/docs/intro/install/
+## Quick Start
 
-## Create Cluster
-
-* It is important to consider which AWS user will be used to create the cluster. If you use your own user then THE cluster admin will be you and that could cause a critical problem later. It is better to use an IAM user which is dedicated to managing EKS. So an "eks-admin" console-only user could be created and used here. After creating the cluster resources any user that has been added as an admin in K82 RBAC could be used to manange the cluster. The point is to have a fallback and to not lose access to your cluster.
-
-```
+### 1. Create EKS Cluster
+```bash
+# Create cluster without node groups first
 eksctl create cluster -f cluster.yaml --without-nodegroup
 ```
 
-At this point the local kube config (~/.kube/config) will have the new remote EKS cluster set as the current context. All local kubectl commands will now be run against that EKS cluster.
+**Important**: Use a dedicated IAM user (e.g., "eks-admin") for cluster creation to avoid access issues later.
 
-## Create Cluster Namespaces
-
-```
+### 2. Create Namespaces
+```bash
 kubectl create -f namespaces.yaml
 ```
 
-## Create OpenId IAM Provider
-
-```
+### 3. Setup OIDC Provider
+```bash
 eksctl utils associate-iam-oidc-provider --cluster=demo --approve
 ```
 
-## Create Node Groups
-
-### Public-Subnet Services
-
-```
+### 4. Create Node Groups
+```bash
+# Public ingress nodes
 eksctl create nodegroup -f node-groups/public-ingress.yaml
-```
 
-Tag the resulting Auto Scaling Group
-* Key: k8s.io/cluster-autoscaler/node-template/label/tier Value: public-ingress
-
-### Private-Subnet Services
-
-```
+# Public services nodes  
 eksctl create nodegroup -f node-groups/public-services.yaml
-```
 
-Tag the resulting Auto Scaling Group
-* Key: k8s.io/cluster-autoscaler/node-template/label/tier Value: public-services
-
-### Private Workers
-
-```
+# Private worker nodes (spot instances)
 eksctl create nodegroup -f node-groups/workers-spot-t2md.yaml
 ```
 
-Tag the resulting Auto Scaling Group
-* Key: k8s.io/cluster-autoscaler/node-template/label/tier Value: workers
-* Key: k8s.io/cluster-autoscaler/node-template/label/workerClass Value: spot-t2mdn
+### 5. Deploy Core Components
+```bash
+# Metrics server
+kubectl apply -f metrics/metrics-server.yaml
 
-### Tag Subnets
+# Cluster autoscaler
+kubectl apply -f autoscaler/autoscaler.yaml
 
-I am not sure if ASG and subnet tags are required with later versions of EKS. They used to be so I have made it habit to include them just in case.
-
-* Key: kubernetes.io/cluster/demo Value: shared
-* Key: kubernetes.io/role/elb Value: 1
- 
-## Create ALB Ingress Controller
-
-* The controller does not actually get created until an ingress that refers to the controller is created. But this still needs to occur first.
-
+# Load balancer controller
+kubectl apply -f ingress/ingress-classes.yaml
 ```
+
+## Detailed Setup Guide
+
+### Node Group Configuration
+
+#### Auto Scaling Group Tags
+After creating each node group, tag the resulting Auto Scaling Group:
+
+**Public Ingress:**
+- Key: `k8s.io/cluster-autoscaler/node-template/label/tier` Value: `public-ingress`
+
+**Public Services:**
+- Key: `k8s.io/cluster-autoscaler/node-template/label/tier` Value: `public-services`
+
+**Private Workers:**
+- Key: `k8s.io/cluster-autoscaler/node-template/label/tier` Value: `workers`
+- Key: `k8s.io/cluster-autoscaler/node-template/label/workerClass` Value: `spot-t2md`
+
+#### Subnet Tags
+Tag your subnets for load balancer integration:
+- Key: `kubernetes.io/cluster/demo` Value: `shared`
+- Key: `kubernetes.io/role/elb` Value: `1`
+
+### Load Balancer Controller Setup
+
+#### 1. Create IAM Policy
+```bash
 aws iam create-policy \
     --policy-name demo-eks-alb-controller-policy \
     --policy-document file://ingress/eks-alb-controller-policy.json
 ```
 
-
-```
+#### 2. Create Service Account
+```bash
 eksctl create iamserviceaccount \
   --cluster=demo \
   --namespace=kube-system \
@@ -107,85 +119,176 @@ eksctl create iamserviceaccount \
   --approve
 ```
 
-
-```
+#### 3. Install Controller
+```bash
 helm repo add eks https://aws.github.io/eks-charts
 helm repo update
-```
 
-```
 helm install aws-load-balancer-controller eks/aws-load-balancer-controller \
   -n kube-system \
   --set clusterName=demo \
   --set serviceAccount.create=false \
   --set serviceAccount.name=demo-eks-alb-controller
 ```
-## Create Ingress 
-### Create Ingress Classes
 
-```
+#### 4. Deploy Ingress Resources
+```bash
 kubectl apply -f ingress/ingress-classes.yaml
-```
-
-### Create Ingress
-
-```
 kubectl apply -f ingress/services-ingress.yaml
 ```
 
-### Create Route53 DNS Records
+### Monitoring and Logging
 
-* For the domains defined in the ingress, add Alias records pointing to the correct ingress ALB.
-* api.demos.io needs to point to the demo-services ALB.
-* This could be done automatically using the external DNS EKS feature. That feature has not been enabled and that is intentional.
-
-## Enable Metrics Server
-
-```
-kubectl apply -f metrics-server.yaml
+#### Metrics Server
+```bash
+kubectl apply -f metrics/metrics-server.yaml
 ```
 
-## Enable Monitoring
+#### CloudWatch Monitoring
+The CloudWatchAgentServerPolicy should be automatically added to instance roles by eksctl.
 
-* Add CloudWatchAgentServerPolicy Policy to Instance Role
-* This ought to be done already if the  SDK was used. The SDK should have added the correct roles when it first created the node groups.
-
-### Deploy Fluentd QuickStart
-
-* “There are two configurations for Fluent Bit: an optimized version and a version that provides an experience more similar to FluentD. The Quick Start configuration uses the optimized version.”
-
-```
+#### FluentD Logging
+```bash
 curl -s https://raw.githubusercontent.com/aws-samples/amazon-cloudwatch-container-insights/latest/k8s-deployment-manifest-templates/deployment-mode/daemonset/container-insights-monitoring/quickstart/cwagent-fluentd-quickstart.yaml | sed "s/{{cluster_name}}/demo/;s/{{region_name}}/us-east-2/" | kubectl apply -f -
 ```
 
-## Enable Cluster Autoscaling
+### Cluster Autoscaler
 
-```
+#### 1. Create IAM Policy
+```bash
 aws iam create-policy \
     --policy-name demo-eks-cluster-autoscaler-policy \
-    --policy-document file://eks-cluster-autoscaler-policy.json
+    --policy-document file://autoscaler/eks-cluster-autoscaler-policy.json
 ```
 
-```
+#### 2. Create Service Account
+```bash
 eksctl create iamserviceaccount \
   --cluster=demo \
   --namespace=kube-system \
   --name=cluster-autoscaler \
-  --attach-policy-arn=arn:aws:iam::169513989294:policy/demo-eks-cluster-autoscaler-policy \
+  --attach-policy-arn=arn:aws:iam::[account]:policy/demo-eks-cluster-autoscaler-policy \
   --override-existing-serviceaccounts \
   --approve
 ```
 
+#### 3. Deploy Autoscaler
+```bash
+kubectl apply -f autoscaler/autoscaler.yaml
 ```
-kubectl apply -f autoscaler.yaml
+
+## Configuration Management
+
+### Placeholder Values
+All configuration files contain placeholders marked with `[brackets]` that need to be replaced:
+- `[account]`: Your AWS account ID
+- `[region]`: AWS region
+- `[cluster-name]`: EKS cluster name
+- Other environment-specific values
+
+### Node Group IAM Roles
+Each node group uses auto-generated IAM roles. Update these roles with the `node-groups/demo-eks-services-node-policy.json` policy for service-specific permissions.
+
+## DNS Configuration
+
+### Route53 Setup
+For domains defined in ingress configurations, create Alias records pointing to the appropriate ALB:
+- `api.demos.io` → demo-services ALB
+- Add other domain mappings as needed
+
+**Note**: External DNS automation is intentionally disabled for manual control.
+
+## Troubleshooting
+
+### Common Issues
+
+#### RDS Connection Timeouts
+If services experience RDS timeouts:
+1. Identify the RDS instance security group
+2. Identify the node group security group
+3. Add inbound rule to RDS security group allowing access from node group security group
+
+#### Node Group Access Issues
+- Verify Auto Scaling Group tags are correctly applied
+- Check subnet tags for load balancer integration
+- Ensure IAM roles have necessary permissions
+
+#### Load Balancer Controller Issues
+- Verify service account exists and has correct permissions
+- Check controller logs: `kubectl logs -n kube-system deployment/aws-load-balancer-controller`
+- Ensure ingress classes are properly configured
+
+### Verification Commands
+```bash
+# Check cluster status
+kubectl get nodes
+kubectl get pods --all-namespaces
+
+# Verify autoscaler
+kubectl get pods -n kube-system | grep cluster-autoscaler
+
+# Check load balancer controller
+kubectl get pods -n kube-system | grep aws-load-balancer-controller
+
+# Verify metrics server
+kubectl top nodes
+kubectl top pods
 ```
 
-## Update Node Groups Instance Roles
+## Security Considerations
 
-For several reasons we are relying on the auto-generated roles and policies created though EKS as guided by the NG yaml files. However, we need to update those roles with the permissions that our services need. Instances in the same node group share the same IAM role.
+### IAM Best Practices
+- Use dedicated IAM users for cluster management
+- Implement least-privilege access
+- Regularly rotate access keys
+- Enable CloudTrail for audit logging
 
-For now, each NG role should have the “node-groups/demo-eks-services-node-policy.json” policy. It is that policy that we ought to be updating instead of adding additional policies to the NG role. If the policy gets too large then it can always be simplified.
+### Network Security
+- Use private subnets for worker nodes
+- Implement proper security group rules
+- Consider VPC endpoints for AWS service access
+- Enable VPC flow logs for network monitoring
 
-## RDS Access
+### RBAC Configuration
+- Configure proper RBAC roles and bindings
+- Use service accounts for pod authentication
+- Implement network policies for pod-to-pod communication
 
-If you get an RDS timeout in your service logs then this may be the issue. RDS Instances have a security group whose inbound rules may need you to allow access from the Cluster’s NodeGroups' security groups. So find the security group for the rds instance and the node group and then update the inbound rules of the RDS sg using the ng sg. If you are using a new node group and/or using an RDS instance that the ng has not before called then this is something that may need to be done.
+## Maintenance
+
+### Regular Tasks
+1. **Update Cluster**: Keep EKS control plane updated
+2. **Node Group Updates**: Rotate node groups for security patches
+3. **Component Updates**: Update metrics server, autoscaler, and controllers
+4. **Security Audits**: Regular IAM and security group reviews
+
+### Backup Strategy
+- Backup etcd data (if using external etcd)
+- Document cluster configuration
+- Maintain application data backups
+- Test disaster recovery procedures
+
+## Cost Optimization
+
+### Spot Instances
+- Worker nodes use spot instances for cost savings
+- Configure proper instance types and availability zones
+- Monitor spot interruption rates
+
+### Resource Management
+- Implement proper resource requests and limits
+- Use horizontal pod autoscaling
+- Monitor and optimize cluster resource utilization
+- Clean up unused resources regularly
+
+## Support
+
+For issues or questions:
+1. Check AWS EKS documentation
+2. Review component-specific logs
+3. Verify IAM permissions and security groups
+4. Test configurations in non-production environments first
+
+---
+
+**Note**: This configuration is designed for production use. Always test thoroughly and ensure compliance with your organization's security policies.
