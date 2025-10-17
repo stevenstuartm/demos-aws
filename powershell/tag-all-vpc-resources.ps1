@@ -1,65 +1,86 @@
 $PROD_VPC = "vpc-0ae3a1e1450cc2fe8"
 $DEV_VPC = "vpc-f76cfe9e"
 
-function Tag-ResourcesByVpc {
+function Tag-Resources {
     param(
-        [string]$VpcId,
-        [string]$Environment
+        [string[]]$ResourceIds,
+        [string]$Environment,
+        [string]$Domain,
+        [string]$Layer
     )
     
-    Write-Host "Tagging resources in VPC $VpcId as environment=$Environment"
-    
-    aws ec2 create-tags --resources $VpcId --tags Key=environment,Value=$Environment
-    
-    $subnets = aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VpcId" --query 'Subnets[*].SubnetId' --output text
-    if ($subnets) {
-        $subnets -split '\s+' | ForEach-Object { 
-            aws ec2 create-tags --resources $_ --tags Key=environment,Value=$Environment 
-        }
-    }
-    
-    $routeTables = aws ec2 describe-route-tables --filters "Name=vpc-id,Values=$VpcId" --query 'RouteTables[*].RouteTableId' --output text
-    if ($routeTables) {
-        $routeTables -split '\s+' | ForEach-Object { 
-            aws ec2 create-tags --resources $_ --tags Key=environment,Value=$Environment 
-        }
-    }
-    
-    $igws = aws ec2 describe-internet-gateways --filters "Name=attachment.vpc-id,Values=$VpcId" --query 'InternetGateways[*].InternetGatewayId' --output text
-    if ($igws) {
-        $igws -split '\s+' | ForEach-Object { 
-            aws ec2 create-tags --resources $_ --tags Key=environment,Value=$Environment 
-        }
-    }
-    
-    $natGateways = aws ec2 describe-nat-gateways --filter "Name=vpc-id,Values=$VpcId" --query 'NatGateways[*].NatGatewayId' --output text
-    if ($natGateways) {
-        $natGateways -split '\s+' | ForEach-Object { 
-            aws ec2 create-tags --resources $_ --tags Key=environment,Value=$Environment 
-        }
-    }
-    
-    $securityGroups = aws ec2 describe-security-groups --filters "Name=vpc-id,Values=$VpcId" --query 'SecurityGroups[*].GroupId' --output text
-    if ($securityGroups) {
-        $securityGroups -split '\s+' | ForEach-Object { 
-            aws ec2 create-tags --resources $_ --tags Key=environment,Value=$Environment 
-        }
-    }
-    
-    $nacls = aws ec2 describe-network-acls --filters "Name=vpc-id,Values=$VpcId" --query 'NetworkAcls[*].NetworkAclId' --output text
-    if ($nacls) {
-        $nacls -split '\s+' | ForEach-Object { 
-            aws ec2 create-tags --resources $_ --tags Key=environment,Value=$Environment 
-        }
-    }
-    
-    $vpcEndpoints = aws ec2 describe-vpc-endpoints --filters "Name=vpc-id,Values=$VpcId" --query 'VpcEndpoints[*].VpcEndpointId' --output text
-    if ($vpcEndpoints) {
-        $vpcEndpoints -split '\s+' | ForEach-Object { 
-            aws ec2 create-tags --resources $_ --tags Key=environment,Value=$Environment 
+    foreach ($resourceId in $ResourceIds) {
+        if ($resourceId -and $resourceId.Trim()) {
+            Write-Host "  Resource: $resourceId"
+            aws ec2 create-tags --resources $resourceId --tags Key=environment,Value=$Environment Key=domain,Value=$Domain Key=layer,Value=$Layer
+            if ($LASTEXITCODE -eq 0) {
+                Write-Host "    Success" -ForegroundColor Green
+            } else {
+                Write-Host "    Failed" -ForegroundColor Red
+            }
         }
     }
 }
 
-#Tag-ResourcesByVpc -VpcId $DEV_VPC -Environment "dev"
-Tag-ResourcesByVpc -VpcId $PROD_VPC -Environment "prod"
+function Tag-ResourcesByVpc {
+    param(
+        [string]$VpcId,
+        [string]$Environment,
+        [string]$Domain,
+        [string]$Layer
+    )
+    
+    Write-Host "`nTagging resources in VPC $VpcId with environment=$Environment, domain=$Domain, layer=$Layer`n" -ForegroundColor Cyan
+    
+    Write-Host "VPC:"
+    Tag-Resources -ResourceIds @($VpcId) -Environment $Environment -Domain $Domain -Layer $Layer
+    
+    $subnets = aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VpcId" --query 'Subnets[*].SubnetId' --output text
+    if ($subnets) {
+        Write-Host "`nSubnets:"
+        Tag-Resources -ResourceIds ($subnets -split '\s+') -Environment $Environment -Domain $Domain -Layer $Layer
+    }
+    
+    $routeTables = aws ec2 describe-route-tables --filters "Name=vpc-id,Values=$VpcId" --query 'RouteTables[*].RouteTableId' --output text
+    if ($routeTables) {
+        Write-Host "`nRoute Tables:"
+        Tag-Resources -ResourceIds ($routeTables -split '\s+') -Environment $Environment -Domain $Domain -Layer $Layer
+    }
+    
+    $igws = aws ec2 describe-internet-gateways --filters "Name=attachment.vpc-id,Values=$VpcId" --query 'InternetGateways[*].InternetGatewayId' --output text
+    if ($igws) {
+        Write-Host "`nInternet Gateways:"
+        Tag-Resources -ResourceIds ($igws -split '\s+') -Environment $Environment -Domain $Domain -Layer $Layer
+    }
+    
+    $natGateways = aws ec2 describe-nat-gateways --filter "Name=vpc-id,Values=$VpcId" --query 'NatGateways[*].NatGatewayId' --output text
+    if ($natGateways) {
+        Write-Host "`nNAT Gateways:"
+        Tag-Resources -ResourceIds ($natGateways -split '\s+') -Environment $Environment -Domain $Domain -Layer $Layer
+    }
+    
+    $securityGroups = aws ec2 describe-security-groups --filters "Name=vpc-id,Values=$VpcId" --query 'SecurityGroups[*].GroupId' --output text
+    if ($securityGroups) {
+        Write-Host "`nSecurity Groups:"
+        Tag-Resources -ResourceIds ($securityGroups -split '\s+') -Environment $Environment -Domain $Domain -Layer $Layer
+    }
+    
+    $nacls = aws ec2 describe-network-acls --filters "Name=vpc-id,Values=$VpcId" --query 'NetworkAcls[*].NetworkAclId' --output text
+    if ($nacls) {
+        Write-Host "`nNetwork ACLs:"
+        Tag-Resources -ResourceIds ($nacls -split '\s+') -Environment $Environment -Domain $Domain -Layer $Layer
+    }
+    
+    $vpcEndpoints = aws ec2 describe-vpc-endpoints --filters "Name=vpc-id,Values=$VpcId" --query 'VpcEndpoints[*].VpcEndpointId' --output text
+    if ($vpcEndpoints) {
+        Write-Host "`nVPC Endpoints:"
+        Tag-Resources -ResourceIds ($vpcEndpoints -split '\s+') -Environment $Environment -Domain $Domain -Layer $Layer
+    }
+    
+    Write-Host "`nCompleted tagging for VPC $VpcId" -ForegroundColor Cyan
+}
+
+Tag-ResourcesByVpc -VpcId $PROD_VPC -Environment "prod" -Domain "platform" -Layer "network"
+Tag-ResourcesByVpc -VpcId $DEV_VPC -Environment "dev" -Domain "platform" -Layer "network"
+
+Write-Host "All VPC resources tagged with: environment, domain, layer"
