@@ -3,21 +3,33 @@ version: 0.2
 phases:   
   install:
     runtime-versions:
-      dotnet: 8.0
+      dotnet: 9.0.203
     commands:
       - echo "=== INSTALL PHASE STARTED ==="
+      - |
+        if [ -z "$DEMO_STAGE" ]; then
+          echo "ERROR: DEMO_STAGE environment variable is not set in CodeBuild project"
+          exit 1
+        fi
+        if [ -z "$DEMO_ENVIRONMENT" ]; then
+          echo "ERROR: DEMO_ENVIRONMENT environment variable is not set in CodeBuild project"
+          exit 1
+        fi
       - export PATH="$PATH:/root/.dotnet/tools"
       - dotnet tool install -g AWS.CodeArtifact.NuGet.CredentialProvider
       - dotnet codeartifact-creds install
-      - ENVVAR_APP="demo-services"
-      - ENVAR_PROJECT_NAME='DEMO.Service'
-      - ENVVAR_DEMO_STAGE='prod'
+      - ENVVAR_APP="services-demo"
+      - ENVAR_PROJECT_NAME='Services.Demo'
+      - ENVVAR_DEMO_STAGE=$DEMO_STAGE
+      - ENVVAR_DEMO_ENVIRONMENT=$DEMO_ENVIRONMENT
+      - echo "Stage is $ENVVAR_DEMO_STAGE"
+      - echo "Environment is $ENVVAR_DEMO_ENVIRONMENT"
       - ENVVAR_BUILD_TYPE="Release"
       - ENVVAR_DEMO_ACCOUNT=$(aws sts get-caller-identity --query "Account" --output text)
       - ENVVAR_DEMO_REGION='us-east-2'
-      - ENVVAR_ECS_CLUSTER=$ENVVAR_DEMO_STAGE-public-services
-      - ENVVAR_ECS_SERVICE=$ENVVAR_DEMO_STAGE-$ENVVAR_APP
-      - ENVVAR_TASK_DEFINITION_FAMILY=$ENVVAR_DEMO_STAGE-$ENVVAR_APP
+      - ENVVAR_ECS_CLUSTER=$ENVVAR_DEMO_ENVIRONMENT-public-services
+      - ENVVAR_ECS_SERVICE=$ENVVAR_DEMO_ENVIRONMENT-$ENVVAR_APP
+      - ENVVAR_TASK_DEFINITION_FAMILY=$ENVVAR_DEMO_ENVIRONMENT-$ENVVAR_APP
       - ENVVAR_CONTAINER_NAME=$ENVVAR_APP
       - echo "=== INSTALL PHASE COMPLETED ==="
       
@@ -35,7 +47,12 @@ phases:
       - export ecrRepo=$ENVVAR_DEMO_ACCOUNT.dkr.ecr.$ENVVAR_DEMO_REGION.amazonaws.com/$ENVVAR_APP
       - echo "ECR Repository $ecrRepo"
       - aws ecr get-login-password --region $ENVVAR_DEMO_REGION | docker login --username AWS --password-stdin $ENVVAR_DEMO_ACCOUNT.dkr.ecr.$ENVVAR_DEMO_REGION.amazonaws.com
-      - imageVersion=$releaseVersion
+      - |
+        if [ "$ENVVAR_DEMO_STAGE" = "prod" ]; then
+          imageVersion=$releaseVersion
+        else
+          imageVersion=$prereleaseVersion
+        fi
       - echo "Image version to deploy $imageVersion"
       - deployOnly=0
       - IMAGE_META="$( aws ecr batch-get-image --repository-name=$ENVVAR_APP --image-ids=imageTag=$imageVersion --query 'images[].imageId.imageTag' --output text )"
@@ -63,7 +80,7 @@ phases:
           dotnet build -c $ENVVAR_BUILD_TYPE $ENVAR_PROJECT_NAME.sln
           
           echo "Building Docker image..."
-          docker build -t $ecrRepo:$imageVersion . -f Dockerfile --build-arg demo_NUGET_SOURCE=$demo_nuget_source --build-arg demo_NUGET_TOKEN=$demo_nuget_token
+          docker build -t $ecrRepo:$imageVersion . -f Dockerfile --build-arg demo_nuget_source=$demo_nuget_source --build-arg demo_nuget_token=$demo_nuget_token
           
           echo "Docker build completed"
         else
@@ -77,6 +94,10 @@ phases:
     - echo "deployOnly value in post_build $deployOnly"
     - |
         if [ "$deployOnly" = 0 ]; then
+          echo "Running migrations and pushing image..."
+          pwsh
+          echo "Running migration command: $ENVAR_PROJECT_NAME.Migrations/bin/$ENVVAR_BUILD_TYPE/net9.0/$ENVAR_PROJECT_NAME.Migrations environment:$ENVVAR_DEMO_ENVIRONMENT"
+          $ENVAR_PROJECT_NAME.Migrations/bin/$ENVVAR_BUILD_TYPE/net9.0/$ENVAR_PROJECT_NAME.Migrations environment:$ENVVAR_DEMO_ENVIRONMENT
           echo "Pushing Docker image..."
           docker push $ecrRepo:$imageVersion
           echo "Image push completed"
@@ -96,17 +117,18 @@ phases:
           CURRENT_TASK_DEF=$(aws ecs describe-task-definition --task-definition $ENVVAR_TASK_DEFINITION_FAMILY --query 'taskDefinition')
           echo "Retrieved current task definition"
           
-          NEW_TASK_DEF=$(echo $CURRENT_TASK_DEF | jq --arg IMAGE "$ecrRepo:$imageVersion" --arg CONTAINER "$ENVVAR_CONTAINER_NAME" --arg demo_ACCOUNT "$ENVVAR_DEMO_ACCOUNT" --arg demo_REGION "$ENVVAR_DEMO_REGION" --arg demo_STAGE "$ENVVAR_DEMO_STAGE" '
+          NEW_TASK_DEF=$(echo $CURRENT_TASK_DEF | jq --arg IMAGE "$ecrRepo:$imageVersion" --arg CONTAINER "$ENVVAR_CONTAINER_NAME" --arg DEMO_ACCOUNT "$ENVVAR_DEMO_ACCOUNT" --arg DEMO_REGION "$ENVVAR_DEMO_REGION" --arg DEMO_STAGE "$ENVVAR_DEMO_STAGE" --arg DEMO_ENVIRONMENT "$ENVVAR_DEMO_ENVIRONMENT" '
             .containerDefinitions |= map(
               if .name == $CONTAINER then
                 .image = $IMAGE |
                 .environment = ([
                   {"name": "ASPNETCORE_HTTP_PORTS", "value": "80"},
-                  {"name": "demo_ACCOUNT", "value": $demo_ACCOUNT},
+                  {"name": "DEMO_ACCOUNT", "value": $DEMO_ACCOUNT},
                   {"name": "ASPNETCORE_ENVIRONMENT", "value": "Production"},
-                  {"name": "demo_REGION", "value": $demo_REGION},
-                  {"name": "demo_STAGE", "value": $demo_STAGE}
-                ] + ((.environment // []) | map(select(.name | IN("ASPNETCORE_HTTP_PORTS", "demo_ACCOUNT", "ASPNETCORE_ENVIRONMENT", "demo_REGION", "demo_STAGE") | not))))
+                  {"name": "DEMO_REGION", "value": $DEMO_REGION},
+                  {"name": "DEMO_STAGE", "value": $DEMO_STAGE},
+                  {"name": "DEMO_ENVIRONMENT", "value": $DEMO_ENVIRONMENT}
+                ] + ((.environment // []) | map(select(.name | IN("ASPNETCORE_HTTP_PORTS", "DEMO_ACCOUNT", "ASPNETCORE_ENVIRONMENT", "DEMO_REGION", "DEMO_STAGE", "DEMO_ENVIRONMENT") | not))))
               else . 
               end
             ) |
